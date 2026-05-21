@@ -11,21 +11,23 @@
 #define EPD_RES  27
 #define EPD_BUSY 25
 #define EPD_PWR  26
+// define button via GPIO mapping
+#define WIFI_RESET_BUTTON 21
 
-// CHANGE THIS to your button GPIO.
+
 // Must be a valid deep-sleep wake-capable pin.
 #define NEXT_BUTTON_PIN 0
 
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
-#include <WiFiManager.h>
+#include <WiFiManager.h> // included to manage wifi connection via portal prompt
 #include <vector>
 #include <ctype.h>
 
 #include "epd_driver.h"
-#include "firasans20.h"
-#include "firasans36.h"
+#include "firasans20.h" // default font
+#include "firasans36.h" // modified font using fontconvert.py upsizing to 36
 #include "utilities.h"
 
 const long GMT_OFFSET_SEC = -19000;
@@ -39,6 +41,10 @@ uint8_t* framebuffer = NULL;
 RTC_DATA_ATTR char savedFact[2048] = "";
 RTC_DATA_ATTR char savedDateStr[48] = "Date unavailable";
 RTC_DATA_ATTR int currentPage = 0;
+RTC_DATA_ATTR bool savedWifiOk = false;
+RTC_DATA_ATTR int savedWifiRSSI = 0;
+
+
 
 // Layout
 const int MARGIN = 30;
@@ -73,11 +79,13 @@ String fetchFact() {
 }
 
 bool connectWifiWithPortal() {
-    WiFiManager wm;
+    WiFi.mode(WIFI_STA);
 
-    // If credentials are saved, it connects automatically.
-    // If not, it starts a temporary hotspot.
-    wm.setConfigPortalTimeout(180);
+    WiFiManager wm;
+    wm.setDebugOutput(true);
+
+    // 0 = stay open until configured
+    wm.setConfigPortalTimeout(0);
 
     bool connected = wm.autoConnect("DeskCalendarSetup");
 
@@ -105,12 +113,27 @@ uint64_t secondsUntilMidnight() {
     return (uint64_t)(86400 - elapsed);
 }
 
-std::vector<String> wrapTextToLines(const String& text, int maxWidth) {
+int availableWidthForLine(int lineIndex) {
+    int y = FACT_Y + (lineIndex * LINE_H);
+
+    bool overlapsCalendar =
+        y >= (BOX_Y - LINE_H) &&
+        y <= (BOX_Y + BOX_H);
+
+    if (overlapsCalendar) {
+        return BOX_X - FACT_X - 20; 
+    }
+
+    return FACT_W;
+}
+
+std::vector<String> wrapTextToLines(const String& text) {
     std::vector<String> lines;
 
     String src = text;
     String line = "";
     int start = 0;
+    int lineIndex = 0;
 
     while (start <= (int)src.length()) {
         int spaceIdx = src.indexOf(' ', start);
@@ -118,6 +141,8 @@ std::vector<String> wrapTextToLines(const String& text, int maxWidth) {
 
         String word = src.substring(start, spaceIdx);
         String test = line.length() == 0 ? word : line + " " + word;
+
+        int maxWidth = availableWidthForLine(lineIndex);
 
         int32_t cx = 0;
         int32_t cy = 0;
@@ -137,6 +162,7 @@ std::vector<String> wrapTextToLines(const String& text, int maxWidth) {
 
         if (tw > maxWidth && line.length() > 0) {
             lines.push_back(line);
+            lineIndex++;
             line = word;
         } else {
             line = test;
@@ -160,11 +186,19 @@ void drawBorder() {
     epd_draw_rect(10, 10, EPD_WIDTH - 35, EPD_HEIGHT - 35, 0, framebuffer);
 }
 
+void resetWifiSettings() {
+    WiFiManager wm;
+    wm.resetSettings();
+    delay(500);
+    ESP.restart();
+}
+
 void drawHeader(const char* dateStr) {
     int cx = MARGIN;
     int cy = MARGIN + FiraSans20.advance_y + FiraSans20.descender;
 
     writeln((GFXfont*)&FiraSans20, dateStr, &cx, &cy, framebuffer);
+    drawStatusLine();
 
     int lineY = cy + 12;
     epd_draw_hline(MARGIN, lineY, EPD_WIDTH - MARGIN * 2, 0, framebuffer);
@@ -175,7 +209,7 @@ void drawHeader(const char* dateStr) {
 }
 
 void drawFactPage(const String& fact, int page) {
-    std::vector<String> lines = wrapTextToLines(fact, FACT_W);
+    std::vector<String> lines = wrapTextToLines(fact);
 
     int maxLines = linesPerPage();
     int totalPages = max(1, (int)((lines.size() + maxLines - 1) / maxLines));
@@ -190,6 +224,7 @@ void drawFactPage(const String& fact, int page) {
 
     for (int i = 0; i < maxLines && startLine + i < (int)lines.size(); i++) {
         int x = FACT_X;
+
         writeln(
             (GFXfont*)&FiraSans20,
             lines[startLine + i].c_str(),
@@ -197,33 +232,38 @@ void drawFactPage(const String& fact, int page) {
             &y,
             framebuffer
         );
+
         y += LINE_H;
     }
 
-    // Page indicator only appears if needed
-    if (totalPages > 1) {
-        char pageStr[24];
-        snprintf(pageStr, sizeof(pageStr), "Page %d/%d", page + 1, totalPages);
+    bool hasMorePages = page < totalPages - 1;
 
-        int px = MARGIN;
-        int py = EPD_HEIGHT - 45;
-        writeln((GFXfont*)&FiraSans20, pageStr, &px, &py, framebuffer);
+    if (hasMorePages) {
+        int ex = FACT_X;
+        int ey = y + 10;
+
+        writeln(
+            (GFXfont*)&FiraSans20,
+            "...",
+            &ex,
+            &ey,
+            framebuffer
+        );
     }
 }
+    
 
 void drawCalendarBox() {
-    time_t now = time(nullptr);
     struct tm t;
-    localtime_r(&now, &t);
 
     char dayStr[4] = "--";
     char monthStr[8] = "---";
 
-    if (now > 100000) {
+    if (getLocalTime(&t, 1000)) {
         snprintf(dayStr, sizeof(dayStr), "%d", t.tm_mday);
         strftime(monthStr, sizeof(monthStr), "%b", &t);
 
-        for (int i = 0; monthStr[i]; i++) {
+    for (int i = 0; monthStr[i]; i++) {
             monthStr[i] = toupper(monthStr[i]);
         }
     }
@@ -257,6 +297,7 @@ void drawScreen(const char* dateStr, const String& fact, int page) {
     drawHeader(dateStr);
     drawFactPage(fact, page);
 
+
     // Draw last so it remains visually static.
     drawCalendarBox();
 }
@@ -267,11 +308,32 @@ void displayFramebuffer() {
     epd_poweroff();
 }
 
+void drawMessageScreen(const char* line1, const char* line2 = "") {
+    epd_poweron();
+    epd_clear();
+    epd_poweroff();
+
+    memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
+
+    int x = 40;
+    int y = 140;
+
+    writeln((GFXfont*)&FiraSans20, line1, &x, &y, framebuffer);
+
+    if (strlen(line2) > 0) {
+        y += 50;
+        x = 40;
+        writeln((GFXfont*)&FiraSans20, line2, &x, &y, framebuffer);
+    }
+
+    displayFramebuffer();
+}
 void setup() {
     Serial.begin(115200);
     delay(1000);
 
     pinMode(NEXT_BUTTON_PIN, INPUT_PULLUP);
+    pinMode(WIFI_RESET_BUTTON, INPUT_PULLUP);
 
     epd_init();
     epd_poweron();
@@ -284,6 +346,34 @@ void setup() {
         Serial.println("PSRAM alloc failed!");
         while (1);
     }
+
+    // Put the IO21 WiFi reset hold check HERE
+    if (digitalRead(WIFI_RESET_BUTTON) == LOW) {
+    Serial.println("WiFi reset button detected...");
+    Serial.println("Hold for 5 seconds to confirm.");
+
+    unsigned long holdStart = millis();
+
+    while (digitalRead(WIFI_RESET_BUTTON) == LOW) {
+        delay(50);
+
+        if (millis() - holdStart >= 5000) {
+            drawMessageScreen(
+                "Resetting WiFi...",
+                "Restarting setup portal."
+            );
+
+            WiFiManager wm;
+            wm.resetSettings();
+            WiFi.disconnect(true, true);
+
+            delay(1500);
+            ESP.restart();
+        }
+    }
+
+    Serial.println("WiFi reset cancelled.");
+}
 
     esp_sleep_wakeup_cause_t wakeupReason = esp_sleep_get_wakeup_cause();
 
@@ -302,24 +392,58 @@ void setup() {
         currentPage = 0;
         fact = "Could not connect to WiFi.";
 
+        drawMessageScreen(
+    "Connecting to WiFi...",
+    "Portal opens if needed."
+);
+
         if (connectWifiWithPortal()) {
-            configTime(GMT_OFFSET_SEC, DST_OFFSET_SEC, "pool.ntp.org", "time.nist.gov");
-            delay(2000);
+            drawMessageScreen("WiFi Connected", "Fetching today's fact...");
 
-            updateDateString(savedDateStr, sizeof(savedDateStr));
+    configTime(GMT_OFFSET_SEC, DST_OFFSET_SEC, "pool.ntp.org", "time.nist.gov");
 
-            fact = fetchFact();
-            fact.toCharArray(savedFact, sizeof(savedFact));
+    struct tm timeinfo;
+    bool timeReady = getLocalTime(&timeinfo, 10000);
 
-            WiFi.disconnect(true);
-        } else {
-            strncpy(savedFact, fact.c_str(), sizeof(savedFact));
-            strncpy(savedDateStr, "WiFi unavailable", sizeof(savedDateStr));
-        }
+    if (timeReady) {
+        strftime(savedDateStr, sizeof(savedDateStr), "%A, %B %d %Y", &timeinfo);
+    } else {
+        strncpy(savedDateStr, "Date unavailable", sizeof(savedDateStr));
     }
 
-    drawScreen(savedDateStr, fact, currentPage);
-    displayFramebuffer();
+    fact = fetchFact();
+    // fact =
+    // "This is a deliberately long test fact designed to verify how the page "
+    // "wrapping and next-page behavior works on the e-paper display. It should "
+    // "continue for several sentences so that it exceeds the available fact area "
+    // "and forces the sketch to create multiple pages. The calendar box should "
+    // "remain fixed in the bottom-right corner while the visible fact text changes "
+    // "from page one to page two. If this works correctly, pressing the next-page "
+    // "button should advance through the wrapped text without fetching a new fact.";
+    fact.toCharArray(savedFact, sizeof(savedFact));
+
+    savedWifiOk = true;
+    savedWifiRSSI = WiFi.RSSI();
+    
+
+    WiFi.disconnect(true);
+
+} else {
+
+    strncpy(savedFact, fact.c_str(), sizeof(savedFact));
+    strncpy(savedDateStr, "WiFi unavailable", sizeof(savedDateStr));
+    savedWifiOk = false;
+    savedWifiRSSI = 0;
+   
+}
+    }
+
+    epd_poweron();
+epd_clear();
+epd_poweroff();
+
+drawScreen(savedDateStr, fact, currentPage);
+displayFramebuffer();
 
     free(framebuffer);
     framebuffer = NULL;
@@ -332,6 +456,34 @@ void setup() {
 
     esp_sleep_enable_timer_wakeup(sleepSecs * 1000000ULL);
     esp_deep_sleep_start();
+}
+void drawStatusLine() {
+    char status[32];
+
+    if (savedWifiOk) {
+        snprintf(status, sizeof(status), "WiFi %ddBm", savedWifiRSSI);
+    } else {
+        snprintf(status, sizeof(status), "No WiFi");
+    }
+
+    int32_t cx = 0, cy = 0, x1, y1, tw, th;
+
+    get_text_bounds(
+        (GFXfont*)&FiraSans20,
+        status,
+        &cx,
+        &cy,
+        &x1,
+        &y1,
+        &tw,
+        &th,
+        nullptr
+    );
+
+    int x = EPD_WIDTH - MARGIN - tw;
+    int y = MARGIN + FiraSans20.advance_y + FiraSans20.descender;
+
+    writeln((GFXfont*)&FiraSans20, status, &x, &y, framebuffer);
 }
 
 void loop() {}
